@@ -1,258 +1,237 @@
-#include "tasks.h"
-//#include "rtos_config.h"
-#include "clock_config.h"
+#include <tasks.h>
+#include "main.h"
 #include <queuelib.h>
-
-
-/**********************************************************************************/
-// Module defines
-/**********************************************************************************/
+#include "stdlib.h"
 
 QUEUE ready;
 
-#define FORCE_INLINE 	__attribute__((always_inline)) inline
+//Naked
+void PendSV_Handler( void ) __attribute__ (( naked ));
+//PendSV_Handler:
+//0000120c:   mrs     r0, PSP
 
-#define STACK_FRAME_SIZE			8
-#define STACK_LR_OFFSET				2
-#define STACK_PSR_OFFSET			1
-#define STACK_PC_OFFSET				0 /*TODO Agregar el valor correcto*/
-#define STACK_PSR_DEFAULT			0x01000000
-#define MIN_PRIOR					-1
-#define RTOS_TIC_PERIOD_IN_US 		(1000)
-#define RTOS_STACK_SIZE				(400)
-#define RTOS_MAX_NUMBER_OF_TASKS	(10)
+//Not Naked
+//void PendSV_Handler( void );
+//0000120a:   vraddhn.i<illegal       width 128>      d27, <illegal reg q15.5>, q0
+//0000120e:   add     r7, sp, #0
 
-typedef enum
+#define TASK_PSP	0xFFFFFFFD
+
+enum taskstatus
 {
-	S_READY = 0,
-	S_RUNNING,
-	S_WAITING,
-	S_SUSPENDED
-} task_state_e;
+	INACTIVE = 0,
+	BLOCK,
+	READY,
+	RUNNING,
+	END
+};
 
-typedef enum
+/* task Control Block */
+typedef struct {
+	void *stack;
+	void *orig_stack;
+	//uint8_t in_use;
+	uint8_t status;
+
+} tcb_t;
+
+static tcb_t tasks[MAX_TASKS];
+static int lastTask;
+static int first = 1;
+static int readyqueuestarted = 0;
+static int taskended = 0;
+static int g_scheduler_start = 0;
+
+/*
+ The compiler does not generate prologue and epilogue sequences for functions with
+ __attribute__((naked)).
+
+Without naked attribute, GCC will corrupt R7 which is used for stack pointer.
+If so, after restoring the tasks' context, we will get wrong stack pointer.
+PendSV is not only an interrupt handler but where the context switch happens.
+The R7 is usually used to preserve system call number (ISR number).
+
+Without __attribute__((naked)), it looks like:
+0000120a:   vraddhn.i<illegal       width 128>      d27, <illegal reg q15.5>, q0
+0000120e:   add     r7, sp, #0
+
+//Save the old task's context
+	asm volatile("MRS      R0, PSP\n");
+0000120c:   mrs     r0, PSP
+
+But our pendsv_handler has context switch code at end of
+
+   			// Move the task's stack pointer address into r0
+40			asm volatile("MOV     R0, %0\n" : : "r" (tasks[lastTask].stack));
+			// Restore the new task's context and jump to the task
+41  		asm volatile("LDMIA   R0!, {R4-r11, LR}\n");
+42			asm volatile("MSR     PSP, R0\n");
+43			asm volatile("BX      LR\n");
+
+The core register was changed here and we even have our own return code
+(line 41 to 43)
+that the compiler will never know this.
+
+Compiler don't know we handle core register and stack in C function in
+our own and will never assume user "corrupt" calling convention.
+Compiler is doing its jobs performing regular push R7 and pop R7
+Even in 7.2.1 arm-eabi compiler, there is still push R7 in
+pendsv_handler
+
+So it's reasonable to have naked attribute where we do the context
+switch or have our own register/stack handling in C function.
+ */
+void PendSV_Handler( void )
 {
-	kFromISR = 0,
-	kFromNormalExec
-} task_switch_type_e;
-
-/*Task Control Block*/
-typedef struct
-{
-	uint8_t priority; /*TODO clean priority*/
-	task_state_e state;
-	uint32_t *sp;
-	void (*task_body)();
-	rtos_tick_t local_tick;
-	uint32_t reserved[10];
-	uint32_t stack[RTOS_STACK_SIZE];
-} rtos_tcb_t;
-
-struct
-{
-	uint8_t nTasks;
-	rtos_task_handle_t current_task;
-	rtos_task_handle_t next_task;
-	rtos_tcb_t tasks[RTOS_MAX_NUMBER_OF_TASKS + 1];
-	rtos_tick_t global_tick;
-} task_list =
-{ 0 };
-
-static void reload_systick(void);
-static void dispatcher(task_switch_type_e type);
-static void rr_dispatcher(task_switch_type_e type);
-static void activate_waiting_tasks();
-FORCE_INLINE static void context_switch(task_switch_type_e type);
-static void idle_task(void);
-
-void rtos_start_scheduler(void)
-{
-	SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
-	reload_systick();
-	task_list.global_tick = ZERO;
-	rtos_create_task(idle_task,ZERO,kAutoStart);
-	for (;;);
-}
-
-rtos_task_handle_t rtos_create_task(void (*task_body)(), uint8_t priority, /*TODO clean priority*/
-		rtos_autostart_e autostart)
-{
-	rtos_task_handle_t retval;
-	if (RTOS_MAX_NUMBER_OF_TASKS > task_list.nTasks)/*Checks if it is possible to create more tasks*/
-	{
-		if(kStartSuspended == autostart)
+		if (!_isqueueempty(&ready)) //If the ready queue is not empty then we look for more tasks.
 		{
-			task_list.tasks[task_list.nTasks].state = S_SUSPENDED;
+			/*Save old task*/
+			_enqueue(&ready,lastTask);
+//	        asm volatile(
+//	            "MRS     R0, PSP\n"             // Get the old task's PSP
+//	            "STR     R0, [%0]\n"            // Store PSP onto the stack of the old task
+//	            : : "r" (&tasks[lastTask].stack) // Use tasks[lastTask].stack as the destination address
+//	        );
+	        asm volatile("MRS      R0, PSP\n");
+	        asm volatile("STR     R0, [%0]\n" : : "r" (&tasks[lastTask].stack));
+	        /*Queue curent task*/
+	       //_enqueue(&ready,lastTask);
+
+			/* Find a new task to run */
+			lastTask = _dequeue(&ready);
+			tasks[lastTask].status = RUNNING;
+
+			/* Move the task's stack pointer address into r0 */
+			asm volatile("MOV     R0, %0\n" : : "r" (tasks[lastTask].stack));
+			/* Restore the new task's context and jump to the task */
+			asm volatile("LDMIA   R0!, {R4-R11, LR}\n");
+			asm volatile("MSR     PSP, R0\n");
+			asm volatile("BX      LR\n");
 		}
-		else
+		else //We return to the kernel (main() function) in case we finished all the tasks.
 		{
-			task_list.tasks[task_list.nTasks].state = S_READY;
+			taskended = 1;
+			/* load kernel state */
+			asm volatile("POP     {R4, R5, R6, R7, R8, R9, R10, R11, IP, LR}  \n");
+			asm volatile("MSR     PSR_NZCVQ, IP \n");
+			asm volatile("BX      LR \n");
 		}
-		//task_list.tasks[task_list.nTasks].priority = priority;
-		task_list.tasks[task_list.nTasks].local_tick = ZERO;
-		task_list.tasks[task_list.nTasks].task_body = task_body;
-		task_list.tasks[task_list.nTasks].sp = &(task_list.tasks[task_list.nTasks].stack[RTOS_STACK_SIZE -
-																					STACK_FRAME_SIZE- ONE ]);
-		task_list.tasks[task_list.nTasks].stack[RTOS_STACK_SIZE - STACK_LR_OFFSET] = (uint32_t)task_body;
-		task_list.tasks[task_list.nTasks].stack[RTOS_STACK_SIZE - STACK_PSR_OFFSET] = STACK_PSR_DEFAULT;
-		task_list.nTasks++;
-		retval = task_list.nTasks;
-	}
-	else
-	{
-		retval = RTOS_INVALID_TASK;
-	}
 
-	return retval;
-}
-
-rtos_tick_t rtos_get_clock(void)
-{
-	return task_list.global_tick;
-}
-
-void rtos_delay(rtos_tick_t ticks)
-{
-	task_list.tasks[task_list.current_task].state = S_WAITING;
-	task_list.tasks[task_list.current_task].local_tick = ticks;
-	rr_dispatcher(kFromNormalExec);
-}
-
-void rtos_suspend_task(void)
-{
-	task_list.tasks[task_list.current_task].state = S_SUSPENDED;
-	rr_dispatcher(kFromNormalExec);
-}
-
-void rtos_activate_task(rtos_task_handle_t task)
-{
-	task_list.tasks[task].state = S_READY;
-	rr_dispatcher(kFromNormalExec);
-}
-
-/**********************************************************************************/
-// Local methods implementation
-/**********************************************************************************/
-
-static void dispatcher(task_switch_type_e type)
-{
-	rtos_task_handle_t next_task = task_list.nTasks;
-	int8_t high = MIN_PRIOR;
-	uint8_t i;
-	for(i = 0; i < task_list.nTasks; i++)
-	{
-		if( (high < task_list.tasks[i].priority) && (S_READY == task_list.tasks[i].state
-			 || S_RUNNING == task_list.tasks[i].state) )
-		{
-			high = task_list.tasks[i].priority;
-			next_task = i;
-		}
-	}
-		task_list.next_task = next_task;
-		if(task_list.current_task != next_task)
-		{
-			context_switch(type);
-		}
-}
-
-static void rr_dispatcher(task_switch_type_e type)
-{
-	rtos_task_handle_t next_task = task_list.nTasks;
-	// Find the next task that is ready to run
-	do{
-	    // Move to the next task in a circular manner
-		next_task = (next_task + 1) % task_list.nTasks;
-
-	    // Check if the next task is ready to run
-		if(S_READY == task_list.tasks[next_task].state || S_RUNNING == task_list.tasks[next_task].state)
-	    	{
-	        	break; // Found a task that can run
-	        }
-	}while (next_task != task_list.current_task); // Loop until we reach back to the current task
-
-	//Update the next_task in the task_list
-	task_list.next_task = next_task;
-	// Perform a context switch if the next task is different from the current task
-	if (task_list.current_task != next_task)
-	{
-		context_switch(type);
-	}
-}
-
-static void reload_systick(void)
-{
-	//SysTick->LOAD = USEC_TO_COUNT(RTOS_TIC_PERIOD_IN_US,
-	      //  CLOCK_GetCoreSysClkFreq());
-	SysTick->LOAD = RTOS_TIC_PERIOD_IN_US * CLOCK_GetCoreSysClkFreq() / 1000000U;
-	SysTick->VAL = 0;
-}
-
-FORCE_INLINE static void context_switch(task_switch_type_e type)
-{
-	static uint8_t first = TRUE;
-	register uint32_t r0 asm("r0");
-	if(!first)
-	{
-		asm("mov r0, r7");
-		task_list.tasks[task_list.current_task].sp = (uint32_t*) r0;
-		if(type)
-		{/**Normal execution*/
-			task_list.tasks[task_list.current_task].sp = task_list.tasks[task_list.current_task].sp - 9;
-		}
-		else
-		{/**From ISR*/
-			task_list.tasks[task_list.current_task].sp = task_list.tasks[task_list.current_task].sp + 9;
-		}
-	}
-	else
-	{
-		first = ZERO;
-	}
-	task_list.current_task = task_list.next_task;
-	task_list.tasks[task_list.current_task].state = S_RUNNING;
-	//task_list.current_task = task_list.next_task;
-	SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
-}
-
-static void activate_waiting_tasks()
-{
-	uint8_t in;
-	for(in = 0; in < task_list.nTasks; in++)
-	{
-		if(S_WAITING == task_list.tasks[in].state)
-		{
-			task_list.tasks[in].local_tick--;
-			if(ZERO == task_list.tasks[in].local_tick)
-			{
-				task_list.tasks[in].state = S_READY;
-			}
-		}
-	}
-}
-
-static void idle_task(void)
-{
-	for (;;)
-	{
-
-	}
 }
 
 void SysTick_Handler(void)
 {
-	task_list.global_tick++;
-	activate_waiting_tasks();
-	reload_systick();
-	rr_dispatcher(kFromISR);
+	if (g_scheduler_start)
+	{
+		SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+	}
 }
 
-void PendSV_Handler(void)
+void task_start()
 {
-	register uint32_t r0 asm("r0");
-	(void)r0;
-	SCB->ICSR |= SCB_ICSR_PENDSVCLR_Msk;
-	r0 = (uint32_t)task_list.tasks[task_list.current_task].sp;
-	asm("mov r7, r0");
+	lastTask = _dequeue(&ready);
+	tasks[lastTask].status = RUNNING;
+	g_scheduler_start = 1;
+
+	if (taskended)
+	{
+		return;
+	}
+
+	/* Save kernel context */
+	asm volatile ("MRS    IP, PSR \n"); //ip and/or IP - Intra procedure call scratch register. This is a synonym for R12.
+	asm volatile ("PUSH   {R4, R5, R6, R7, R8, R9, R10, R11, IP, LR} \n");
+
+	/* To bridge the variable in C and the register in ASM,
+	 * move the task's stack pointer address into r0.
+	 * http://www.ethernut.de/en/documents/arm-inline-asm.html
+	 */
+	asm volatile("MOV     R0, %0\n" : : "r" (tasks[lastTask].stack));
+	/* Load user task's context and jump to the task */
+	asm volatile("MSR     PSP, R0\n");
+	asm volatile("MOV     R0, #2\n");
+	asm volatile("MSR     CONTROL, R0\n");
+	asm volatile("ISB \n");
+	asm volatile("POP     {R4-R11, LR}\n");
+	asm volatile("POP     {R0}\n");
+	//g_scheduler_start = 1;
+	asm volatile("BX      LR\n");
 
 }
 
+int task_create(void (*run)(void *), void *userdata)
+{
+	/* Find a free thing */
+	int taskId = 0;
+	uint32_t *stack;
+
+	if (readyqueuestarted == 0)
+	{
+		//init ready queue
+		_initqueue(&ready);
+		readyqueuestarted = 1;
+	}
+
+	for (taskId = 0; taskId < MAX_TASKS; taskId++)
+	{
+		if (tasks[taskId].status == INACTIVE)
+			break;
+	}
+
+	if (taskId == MAX_TASKS)
+		return -1;
+
+	/* Create the stack */
+	stack = (uint32_t *) malloc(STACK_SIZE * sizeof(uint32_t));
+	tasks[taskId].orig_stack = stack;
+	if (stack == 0)
+		return -1;
+
+	stack += STACK_SIZE - 32; /* End of stack, minus what we are about to push */
+	if (first) {
+		stack[8] =  (unsigned int) run;
+		stack[9] =  (unsigned int) userdata;
+		first = 0;
+	} else {
+		stack[8] =  (unsigned int) TASK_PSP;
+		stack[9] =  (unsigned int) userdata;
+		stack[14] = (unsigned) &task_start;
+		stack[15] = (unsigned int) run;
+		stack[16] = (unsigned int) 0x01000000; /* PSR Thumb bit */
+	}
+
+	/* Construct the control block */
+	tasks[taskId].stack = stack;
+	tasks[taskId].status = READY;
+
+	//add to the ready queue
+	_enqueue(&ready, taskId);
+
+	return taskId;
+}
+
+void task_kill(int task_id)
+{
+	tasks[task_id].status = END; //We end the task
+
+	/* Free the stack */
+	free(tasks[task_id].orig_stack);
+}
+
+void task_self_terminal()
+{
+	/* This will kill the stack.
+	 * For now, disable context switches to save ourselves.
+
+	CPS - Change Processor State.
+	ID - Interrupt or abort disable.
+	IE - Interrupt or abort enable.
+	I - Enables or disables IRQ interrupts.
+	*/
+	//asm volatile("CPSID   I\n"); //Change the state of the Cortex-M4 and dissable the interrupts.
+	//task_kill(lastTask);
+	//asm volatile("CPSIE   I\n"); //Change the state of the Cortex-M4 and enable the interrupts.
+
+	/* And now wait for death to kick in */
+	//while (1);
+}
