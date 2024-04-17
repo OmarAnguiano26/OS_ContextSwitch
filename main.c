@@ -57,59 +57,48 @@ static void delay(volatile int count)
 
 void task1(void *userdata)
 {
-	uint8_t counter = 0;
 	while(1)
 	{
-		PRINTF("IN TASK 1: %i +++++++++++++++\r\n", counter);
-		counter++;
-		delay(100);
+		PRINTF(": Running...1\n\r");
+		delay(1000);
 	}
 }
 
 void task2(void *userdata)
 {
-	uint8_t counter = 0;
 	while(1)
 	{
-		PRINTF("IN TASK 2: %i +++++++++++++++\r\n", counter);
-		counter++;
-		delay(100);
+		PRINTF(": Running...2\n\r");
+		delay(1000);
 	}
 }
 
 void task3(void *userdata)
 {
-	uint8_t counter = 0;
 	while(1)
 	{
-		PRINTF("IN TASK 3: %i +++++++++++++++\r\n", counter);
-		counter++;
-		delay(100);
+		PRINTF(": Running...3\n\r");
+		delay(1000);
 	}
 }
 
 void task4(void *userdata)
 {
-	uint8_t counter = 0;
 	while(1)
 	{
-		PRINTF("IN TASK 4: %i +++++++++++++++\r\n", counter);
-		counter++;
-		delay(100);
+		PRINTF(": Running...4\n\r");
+		delay(1000);
 	}
 }
 
 void task5(void *userdata)
 {
-	uint8_t counter = 0;
 	while(1)
 	{
-		PRINTF("IN TASK 5: %i +++++++++++++++\r\n", counter);
-		counter++;
-		delay(100);
+		PRINTF(": Running...5\n\r");
+		delay(1000);
 	}
 }
-
 /*******************************************************************************
  * Prototypes
  ******************************************************************************/
@@ -151,12 +140,26 @@ int main(void)
 	GPIO_PortClear(BOARD_LED_BLUE_GPIO, 1u << BOARD_LED_BLUE_GPIO_PIN);
 	GPIO_PortSet(BOARD_LED_BLUE_GPIO, 1u << BOARD_LED_BLUE_GPIO_PIN);
 
-	rtos_create_task(task1, 1, kAutoStart);
-	rtos_create_task(task2, 2, kAutoStart);
-	rtos_create_task(task3, 1, kAutoStart);
-	rtos_create_task(task4, 2, kAutoStart);
-	rtos_create_task(task5, 1, kAutoStart);
-	rtos_start_scheduler();
+	if (task_create(task1, (void *) str1) == -1)
+		PRINTF("task 1 creation failed\r\n");
+
+	if (task_create(task2, (void *) str2) == -1)
+		PRINTF("task 2 creation failed\r\n");
+
+	if (task_create(task3, (void *) str3) == -1)
+		PRINTF("task 3 creation failed\r\n");
+
+	if (task_create(task4, (void *) str4) == -1)
+		PRINTF("task 4 creation failed\r\n");
+
+	if (task_create(task5, (void *) str5) == -1)
+		PRINTF("task 5 creation failed\r\n");
+
+	NVIC_SetPriority(PendSV_IRQn, 0xF); // Set PendSV to lowest possible priority
+	SysTick_Config(SystemCoreClock/SYSTICK_FREQUENCY_HZ); //20 hertz is 50 ms for a systick.
+
+	task_start();
+
 	PRINTF("The execution of all the tasks ended!\n\r");
 
 	while (1)
